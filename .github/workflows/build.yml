@@ -1,0 +1,128 @@
+name: PDF Magic app builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'What should I do?'
+        type: choice
+        default: build-app
+        options:
+          - build-app
+          - make-signing-key
+      key_password:
+        description: 'Only for make-signing-key: choose a password (8 or more letters and numbers, no spaces)'
+        required: false
+        type: string
+  push:
+    paths:
+      - 'project.zip'
+
+permissions:
+  contents: read
+
+jobs:
+  build-app:
+    if: github.event_name == 'push' || github.event.inputs.task == 'build-app'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project
+        run: |
+          test -f project.zip || { echo "project.zip is missing. Upload it to the main page of the repository first."; exit 1; }
+          mkdir pm
+          unzip -q project.zip -d pm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android 16 build tools
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" || echo "Gradle will fetch what is missing."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Get the PDF engines (packed inside the app so it works offline)
+        run: cd pm && bash scripts/fetch-libs.sh
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Check the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "Using your signing key."
+          elif [ -f pm/signing/pdfmagic-upload.jks ]; then
+            echo "Using the signing key that is inside project.zip (signing folder)."
+          else
+            echo "No signing key found. The APK gets a test signature: fine for trying the app, not for Google Play."
+          fi
+
+      - name: Build the APK and the Play Store bundle
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          VERSION_CODE: ${{ github.run_number }}
+        run: cd pm && gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Save the APK (install this on your phone)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDF-Magic-APK
+          path: pm/app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+      - name: Save the Play Store bundle (upload this to Google Play)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDF-Magic-PlayStore-AAB
+          path: pm/app/build/outputs/bundle/release/*.aab
+          retention-days: 30
+
+  make-signing-key:
+    if: github.event.inputs.task == 'make-signing-key'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create your signing key
+        env:
+          PASS: ${{ github.event.inputs.key_password }}
+        run: |
+          if [ "${#PASS}" -lt 8 ]; then echo "Type a password with 8 or more characters in the box, then run again."; exit 1; fi
+          keytool -genkeypair -keystore pdfmagic-upload.jks -storetype PKCS12 -alias pdfmagic \
+            -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" \
+            -dname "CN=PDF Magic, O=PDF Magic, C=IN"
+          base64 -w0 pdfmagic-upload.jks > keystore-base64.txt
+          {
+            echo "Add these 4 secrets in your repository: Settings > Secrets and variables > Actions > New repository secret"
+            echo ""
+            echo "KEYSTORE_BASE64   = everything inside keystore-base64.txt"
+            echo "KEYSTORE_PASSWORD = the password you typed"
+            echo "KEY_ALIAS         = pdfmagic"
+            echo "KEY_PASSWORD      = the password you typed (the same one)"
+            echo ""
+            echo "Keep pdfmagic-upload.jks somewhere safe (Google Drive, for example). Then delete this download."
+          } > READ-ME.txt
+
+      - name: Save the key (kept for 1 day only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-key
+          path: |
+            pdfmagic-upload.jks
+            keystore-base64.txt
+            READ-ME.txt
+          retention-days: 1
+
